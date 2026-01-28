@@ -9,7 +9,7 @@ from pathlib import Path
 st.set_page_config(
     page_title="Amentum Scripting v2",
     layout="wide",
-    page_icon="logo_1.png",  # optional favicon (keep logo_1.png next to this file)
+    page_icon="logo_1.png",
 )
 
 # ===========================
@@ -18,17 +18,14 @@ st.set_page_config(
 LOGO_PATH = "logo_1.png"
 # Update this URL to your destination (SharePoint, intranet, company site, etc.)
 LOGO_LINK = "https://www.amentum.com/"
-
-# Logo in Streamlit chrome (top-left) + sidebar. Call early for best results.
 st.logo(LOGO_PATH, size="large", link=LOGO_LINK)
 
 @st.cache_data
 def _img_to_base64(img_path: str) -> str:
-    """Return base64-encoded contents of an image file (cached)."""
     return base64.b64encode(Path(img_path).read_bytes()).decode("utf-8")
 
 def render_top_banner():
-    """Render a clickable logo inside the page body (highlighted header area)."""
+    """Logo inside page body (highlighted header area)."""
     try:
         b64 = _img_to_base64(LOGO_PATH)
         st.markdown(
@@ -42,8 +39,185 @@ def render_top_banner():
             unsafe_allow_html=True,
         )
     except Exception:
-        # Don't break the app if the logo file isn't found
         pass
+
+# ===========================
+# Manual Authentication (Supabase)
+# ===========================
+import bcrypt
+from datetime import datetime, timezone
+
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
+USER_TABLE = st.secrets.get("USER_TABLE", "app_users")
+
+@st.cache_resource
+def _supabase():
+    if create_client is None:
+        raise RuntimeError("Missing dependency: supabase. Add `supabase` to requirements.txt")
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_KEY", "")
+    if not url or not key:
+        raise RuntimeError("Missing SUPABASE_URL / SUPABASE_KEY in Streamlit secrets")
+    return create_client(url, key)
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _hash_password(password: str) -> str:
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+def db_get_user(username: str):
+    sb = _supabase()
+    res = sb.table(USER_TABLE).select("*").eq("username", username).limit(1).execute()
+    data = getattr(res, "data", None) or []
+    return data[0] if data else None
+
+def db_user_exists(username: str) -> bool:
+    return db_get_user(username) is not None
+
+def db_create_user(username: str, role: str, created_by: str):
+    sb = _supabase()
+    payload = {
+        "username": username,
+        "role": role,
+        "password_hash": None,
+        "is_active": True,
+        "created_at": _now_iso(),
+        "created_by": created_by,
+        "password_set_at": None,
+    }
+    sb.table(USER_TABLE).insert(payload).execute()
+
+def db_set_password(username: str, password_hash: str):
+    sb = _supabase()
+    sb.table(USER_TABLE).update({"password_hash": password_hash, "password_set_at": _now_iso()}).eq("username", username).execute()
+
+def db_list_users(limit: int = 200):
+    sb = _supabase()
+    res = sb.table(USER_TABLE).select("username,role,is_active,created_at,created_by,password_set_at").order("created_at", desc=True).limit(limit).execute()
+    return getattr(res, "data", None) or []
+
+def ensure_session_defaults():
+    st.session_state.setdefault("auth_ok", False)
+    st.session_state.setdefault("auth_user", "")
+    st.session_state.setdefault("auth_role", "")
+
+def bootstrap_admin_login():
+    boot_user = st.secrets.get("ADMIN_BOOTSTRAP_USER", "")
+    boot_pw = st.secrets.get("ADMIN_BOOTSTRAP_PASSWORD", "")
+    if not boot_user or not boot_pw:
+        return
+    with st.expander("Admin bootstrap login", expanded=False):
+        u = st.text_input("Bootstrap admin username", key="boot_user").strip()
+        p = st.text_input("Bootstrap admin password", type="password", key="boot_pw")
+        if st.button("Bootstrap login", key="boot_login_btn"):
+            if u != boot_user or p != boot_pw:
+                st.error("Invalid bootstrap credentials")
+                return
+            existing = db_get_user(boot_user)
+            if not existing:
+                db_create_user(boot_user, role="admin", created_by="bootstrap")
+                db_set_password(boot_user, _hash_password(p))
+            st.session_state.auth_ok = True
+            st.session_state.auth_user = boot_user
+            st.session_state.auth_role = "admin"
+            st.success("Bootstrap admin login successful")
+            st.rerun()
+
+def login_flow():
+    render_top_banner()
+    st.title("Sign in")
+    st.caption("Enter your username. If this is your first login (no password set yet), you will be prompted to create a password.")
+    username = st.text_input("Username", key="login_username").strip()
+    if not username:
+        bootstrap_admin_login()
+        return
+    user = db_get_user(username)
+    if not user:
+        st.error("Invalid user")
+        bootstrap_admin_login()
+        return
+    if not bool(user.get("is_active", True)):
+        st.error("Your account is inactive. Please contact the admin.")
+        bootstrap_admin_login()
+        return
+    stored = user.get("password_hash")
+    if not stored:
+        st.info("First login detected. Please create your password.")
+        p1 = st.text_input("Create password", type="password", key="p1")
+        p2 = st.text_input("Confirm password", type="password", key="p2")
+        if st.button("Set password", key="set_pw_btn"):
+            if len(p1) < 8:
+                st.error("Password must be at least 8 characters.")
+                return
+            if p1 != p2:
+                st.error("Passwords do not match.")
+                return
+            db_set_password(username, _hash_password(p1))
+            st.success("Password saved. Please log in with your new password.")
+            st.session_state.pop("p1", None)
+            st.session_state.pop("p2", None)
+            st.rerun()
+        bootstrap_admin_login()
+        return
+    pw = st.text_input("Password", type="password", key="login_password")
+    if st.button("Login", key="login_btn"):
+        if _verify_password(pw, stored):
+            st.session_state.auth_ok = True
+            st.session_state.auth_user = username
+            st.session_state.auth_role = user.get("role", "user") or "user"
+            st.success("Login successful")
+            st.rerun()
+        else:
+            st.error("Invalid password")
+    bootstrap_admin_login()
+
+def require_auth_gate():
+    ensure_session_defaults()
+    if not st.session_state.get("auth_ok", False):
+        login_flow()
+        st.stop()
+
+def logout_button():
+    if st.sidebar.button("Logout", key="logout_btn"):
+        st.session_state.auth_ok = False
+        st.session_state.auth_user = ""
+        st.session_state.auth_role = ""
+        st.rerun()
+
+def admin_panel():
+    render_top_banner()
+    st.title("Admin")
+    st.caption("Create usernames. New users will set their password on first login.")
+    with st.expander("Create new user", expanded=True):
+        new_user = st.text_input("New username", key="admin_new_user").strip()
+        new_role = st.selectbox("Role", ["user", "admin"], index=0, key="admin_new_role")
+        if st.button("Create user", key="admin_create_btn"):
+            if not new_user:
+                st.error("Username cannot be empty")
+            elif db_user_exists(new_user):
+                st.warning("User already exists")
+            else:
+                db_create_user(new_user, new_role, created_by=st.session_state.get("auth_user", "admin"))
+                st.success(f"User {new_user} created")
+                st.rerun()
+    st.subheader("Users")
+    try:
+        import pandas as pd
+        st.dataframe(pd.DataFrame(db_list_users()), use_container_width=True)
+    except Exception:
+        st.write(db_list_users())
 
 # ---------------------------
 # RADIO CLI APP (merged from v6.py)
@@ -1403,7 +1577,7 @@ def reset_table_state():
 
 
 def radio_main():
-    # (moved to Home_merged.py) st.set_page_config(...) 
+    # (moved to Home_merged_supabase_auth.py) st.set_page_config(...) 
     init_state()
 
     st.title("E:// Radio CLI Script — v2")
@@ -2029,7 +2203,7 @@ def ret_render():
     st.sidebar.write("Session GUID:", st.session_state["_session_guid"])
     st.session_state["_reruns"] = st.session_state.get("_reruns", 0) + 1
     st.sidebar.write("Reruns:", st.session_state["_reruns"])
-    # (moved to Home_merged.py) st.set_page_config(...) 
+    # (moved to Home_merged_supabase_auth.py) st.set_page_config(...) 
     # ============================================================
     # HARD-CODED ANTENNA MODEL DATABASE
     # ============================================================
@@ -3532,13 +3706,23 @@ def radio_render():
     st.header("Radio CLI")
     radio_main()
 
+# ---- Authentication gate (must run before navigation/router) ----
+require_auth_gate()
+
+st.sidebar.write(f"Signed in as: {st.session_state.get('auth_user','')} ({st.session_state.get('auth_role','user')})")
+logout_button()
 st.sidebar.title("Navigation")
-choice = st.sidebar.radio("Choose", ["Home", "RET Scripting", "Radio CLI"], index=0)
+choices = ["Home", "RET Scripting", "Radio CLI"]
+if st.session_state.get("auth_role","user") == "admin":
+    choices.append("Admin")
+choice = st.sidebar.radio("Choose", choices, index=0)
 
 if choice == "Home":
     home_page()
 elif choice == "RET Scripting":
     ret_render()
+elif choice == "Admin":
+    admin_panel()
 else:
     radio_render()
 
